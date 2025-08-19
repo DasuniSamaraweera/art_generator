@@ -7,7 +7,6 @@ __pycache__/
 *.pyd
 *.log
 output/
-data/images/
 .DS_Store
 .ipynb_checkpoints/
 *.sqlite3
