@@ -78,7 +78,6 @@ class ArtGeneratorApp:
     def test_api_access(self):
         """Test API access and suggest fixes"""
         try:
-            # Test with a simple request
             test_response = requests.get(
                 "https://api-inference.huggingface.co/models/stable-diffusion-v1-5/stable-diffusion-v1-5",
                 headers=self.headers,
@@ -169,13 +168,19 @@ class ArtGeneratorApp:
                 
             # Validate and filter valid images
             valid_rows = []
+            invalid_paths = []
             for idx, row in df.iterrows():
                 image_path = os.path.normpath(row['image_path'])
                 if ArtGeneratorApp.validate_image_path(image_path):
                     valid_rows.append(row)
+                else:
+                    invalid_paths.append(image_path)
                     
             valid_df = pd.DataFrame(valid_rows)
             logger.info(f"Loaded {len(valid_df)}/{len(df)} valid image references")
+            if invalid_paths:
+                logger.warning(f"Invalid image paths: {', '.join(invalid_paths)}")
+                st.warning(f"Invalid images: {', '.join(invalid_paths)}")
             
             if len(valid_df) < len(df):
                 st.warning(f"Only {len(valid_df)}/{len(df)} images are valid and accessible")
@@ -213,11 +218,8 @@ class ArtGeneratorApp:
             
         index_path = "faiss_index"
         
-        # Try to load existing index
         if os.path.exists(index_path):
             try:
-                # Note: We'll implement a simple similarity search instead of FAISS
-                # since FAISS integration with custom embeddings is complex
                 logger.info("Using simple similarity search (FAISS replacement)")
                 return _self.build_simple_index()
             except Exception as e:
@@ -235,16 +237,11 @@ class ArtGeneratorApp:
                 try:
                     image_path = os.path.normpath(row['image_path'])
                     with Image.open(image_path) as image:
-                        # Resize for efficiency
                         image = image.convert('RGB').resize(THUMBNAIL_SIZE)
-                        
                         inputs = self.clip_processor(images=image, return_tensors="pt")
                         embedding = self.clip_model.get_image_features(**inputs)
-                        
                         embeddings.append(embedding.cpu().numpy().flatten())
                         metadata.append(row.to_dict())
-                        
-                        # Cleanup
                         del inputs, embedding
                         
                 except Exception as e:
@@ -270,7 +267,6 @@ class ArtGeneratorApp:
             )
             response.raise_for_status()
             
-            # Handle different response types
             if response.headers.get('content-type', '').startswith('image/'):
                 return {"content": response.content}, None
             else:
@@ -290,12 +286,18 @@ class ArtGeneratorApp:
             nouns = [token.text for token in doc if token.pos_ == "NOUN"]
             adjectives = [token.text for token in doc if token.pos_ == "ADJ"]
             available_styles = self.df['style'].unique().tolist() if not self.df.empty else []
+            
             if style and style != "Auto-detect":
                 detected_style = style
             else:
+                # Prioritize exact matches, then partial matches
+                prompt_lower = prompt.lower()
                 detected_style = next(
-                    (s for s in available_styles if s.lower() in prompt.lower()),
-                    "contemporary"
+                    (s for s in available_styles if s.lower() == prompt_lower),
+                    next(
+                        (s for s in available_styles if s.lower() in prompt_lower),
+                        "contemporary"
+                    )
                 )
             return {
                 "style": detected_style,
@@ -320,17 +322,14 @@ class ArtGeneratorApp:
             
         try:
             with torch.no_grad():
-                # Get text embedding
                 inputs = self.clip_processor(text=query, return_tensors="pt")
                 query_embedding = self.clip_model.get_text_features(**inputs).cpu().numpy().flatten()
                 
-                # Calculate similarities
                 embeddings = self.vectorstore["embeddings"]
                 similarities = np.dot(embeddings, query_embedding) / (
                     np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_embedding)
                 )
                 
-                # Get top k results (limit k to available images)
                 k = min(k, len(embeddings))
                 top_indices = np.argsort(similarities)[-k:][::-1]
                 results = [self.vectorstore["metadata"][i] for i in top_indices]
@@ -348,15 +347,13 @@ class ArtGeneratorApp:
 
     def generate_image(self, prompt: str, references: List[Dict], add_watermark: bool = True) -> Optional[str]:
         """Generate image with enhanced prompt and safety checking"""
-        # List of fallback models to try (image generation models only)
         fallback_models = [
-            #"black-forest-labs/FLUX.1-dev",
-            #"stabilityai/stable-diffusion-xl-base-1.0",
-            "black-forest-labs/FLUX.1-schnell"
+            "black-forest-labs/FLUX.1-schnell",
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            "runwayml/stable-diffusion-v1-5"
         ]
         
         try:
-            # Enhance prompt with reference styles
             if references:
                 styles = [ref.get('style', '') for ref in references if ref.get('style')]
                 style_text = ", ".join(set(styles))
@@ -364,12 +361,10 @@ class ArtGeneratorApp:
             else:
                 enhanced_prompt = prompt
                 
-            # Limit prompt length
             enhanced_prompt = enhanced_prompt[:200]
             
             logger.info(f"Generating image with prompt: {enhanced_prompt}")
             
-            # Try each model until one works
             for model_name in fallback_models:
                 try:
                     model_url = f"https://api-inference.huggingface.co/models/{model_name}"
@@ -399,7 +394,6 @@ class ArtGeneratorApp:
                         logger.warning(f"Invalid response from {model_name}")
                         continue
                         
-                    # Successfully got image data
                     st.success(f"✅ Generated using {model_name}")
                     break
                     
@@ -407,7 +401,6 @@ class ArtGeneratorApp:
                     logger.warning(f"Failed with {model_name}: {e}")
                     continue
             else:
-                # All models failed
                 st.error("❌ All image generation models failed. Please try again later.")
                 st.markdown("""
                 **Troubleshooting:**
@@ -417,22 +410,18 @@ class ArtGeneratorApp:
                 """)
                 return None
                 
-            # Process the successful response
             try:
                 image = Image.open(BytesIO(response_data["content"]))
                 image = image.convert('RGB')
                 
-                # Safety check
                 if not self.check_image_safety(image):
                     st.error("Generated image flagged as inappropriate")
                     logger.warning("Image failed safety check")
                     return None
                     
-                # Add watermark if requested
                 if add_watermark:
                     image = self.add_watermark(image)
                     
-                # Save image
                 timestamp = int(time.time())
                 image_path = f"output/generated_{timestamp}.png"
                 image.save(image_path, format='PNG', optimize=True)
@@ -456,7 +445,6 @@ class ArtGeneratorApp:
         try:
             draw = ImageDraw.Draw(image)
             
-            # Try to load a font, fallback to default
             try:
                 font = ImageFont.truetype("arial.ttf", size=16)
             except:
@@ -468,18 +456,15 @@ class ArtGeneratorApp:
             watermark_text = "Generated by Art Generator"
             
             if font:
-                # Get text dimensions for positioning
                 bbox = draw.textbbox((0, 0), watermark_text, font=font)
                 text_width = bbox[2] - bbox[0]
                 text_height = bbox[3] - bbox[1]
             else:
-                text_width, text_height = 150, 15  # Approximate defaults
+                text_width, text_height = 150, 15
                 
-            # Position watermark in bottom-right corner
             x = image.width - text_width - 10
             y = image.height - text_height - 10
             
-            # Add semi-transparent background
             overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
             overlay_draw = ImageDraw.Draw(overlay)
             overlay_draw.rectangle(
@@ -487,11 +472,9 @@ class ArtGeneratorApp:
                 fill=(0, 0, 0, 128)
             )
             
-            # Composite overlay
             image = Image.alpha_composite(image.convert('RGBA'), overlay).convert('RGB')
             draw = ImageDraw.Draw(image)
             
-            # Draw text
             draw.text((x, y), watermark_text, font=font, fill=(255, 255, 255))
             
             return image
@@ -499,6 +482,33 @@ class ArtGeneratorApp:
         except Exception as e:
             logger.warning(f"Failed to add watermark: {e}")
             return image
+
+    def save_generation_metadata(self, image_path: str, prompt: str, style: str):
+        """Save metadata of generated images to CSV"""
+        metadata_path = "output/generated_images.csv"
+        metadata = {
+            "image_path": image_path,
+            "prompt": prompt,
+            "style": style,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        df = pd.DataFrame([metadata])
+        if os.path.exists(metadata_path):
+            existing_df = pd.read_csv(metadata_path)
+            df = pd.concat([existing_df, df], ignore_index=True)
+        df.to_csv(metadata_path, index=False)
+        logger.info(f"Saved metadata for {image_path}")
+
+    def load_generated_images(self) -> pd.DataFrame:
+        """Load metadata of previously generated images"""
+        metadata_path = "output/generated_images.csv"
+        if os.path.exists(metadata_path):
+            try:
+                return pd.read_csv(metadata_path)
+            except Exception as e:
+                logger.warning(f"Failed to load generated images metadata: {e}")
+                return pd.DataFrame(columns=["image_path", "prompt", "style", "timestamp"])
+        return pd.DataFrame(columns=["image_path", "prompt", "style", "timestamp"])
 
     def manage_rate_limit(self) -> bool:
         """No rate limiting: always allow generation"""
@@ -520,7 +530,6 @@ class ArtGeneratorApp:
             return original_prompt
             
         try:
-            # Simple rule-based feedback integration
             feedback_lower = feedback.lower()
             
             if 'brighter' in feedback_lower or 'bright' in feedback_lower:
@@ -541,17 +550,15 @@ class ArtGeneratorApp:
     def generate_art(self, prompt: str, style: str = "Auto-detect", feedback: str = "") -> GenerationResult:
         """Main art generation pipeline"""
         try:
-            # Extract style elements
             style_info = self.extract_style_elements(prompt, style)
-            # Find similar references
             search_query = f"{style_info['subject']} {style_info['style']}"
             references = self.find_similar_images(search_query, k=2)
-            # Integrate feedback if provided
             final_prompt = style_info['refined_prompt']
             if feedback:
                 final_prompt = self.integrate_feedback(final_prompt, feedback)
-            # Generate image
             image_path = self.generate_image(final_prompt, references)
+            if image_path:
+                self.save_generation_metadata(image_path, prompt, style_info['style'])
             return GenerationResult(
                 image_path=image_path,
                 references=references,
@@ -574,10 +581,8 @@ class ArtGeneratorApp:
         if result.success and result.image_path:
             st.success("🎨 Art generated successfully!")
             
-            # Display main image
             st.image(result.image_path, caption="Your Generated Art", use_container_width=True)
             
-            # Download button
             try:
                 with open(result.image_path, "rb") as file:
                     st.download_button(
@@ -589,14 +594,12 @@ class ArtGeneratorApp:
             except Exception as e:
                 logger.warning(f"Download button setup failed: {e}")
             
-            # Display style information
             if result.style_info:
                 with st.expander("🎭 Style Analysis"):
                     st.write(f"**Detected Style:** {result.style_info.get('style', 'Unknown')}")
                     st.write(f"**Subject:** {result.style_info.get('subject', 'Unknown')}")
                     st.write(f"**Mood:** {result.style_info.get('mood', 'Unknown')}")
             
-            # Display reference images
             if result.references:
                 with st.expander("🖼️ Reference Images Used"):
                     cols = st.columns(len(result.references))
@@ -626,20 +629,27 @@ class ArtGeneratorApp:
         st.title("Personalized Art Generator")
         st.markdown("Create unique artwork using AI with style-aware generation")
         
-        # Sidebar for configuration
         with st.sidebar:
             st.header("Settings")
             
-            # Display system status
             st.subheader("System Status")
             st.write(f"Reference Images: {len(self.df)}")
             st.write(f"Index Status: {'✅ Ready' if self.vectorstore else '❌ Not Available'}")
             st.write(f"Safety Check: {'✅ Active' if self.safety_classifier else '⚠️ Disabled'}")
             
-            # Generation counter
-            # No generation counter needed when rate limiting is removed
+            if st.button("Clear Cache"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success("Cache cleared!")
+            
+            st.subheader("Recent Generations")
+            generated_df = self.load_generated_images()
+            if not generated_df.empty:
+                with st.expander("View Recent Images"):
+                    for _, row in generated_df.tail(5).iterrows():
+                        if os.path.exists(row['image_path']):
+                            st.image(row['image_path'], caption=f"{row['prompt']} ({row['style']})", width=100)
         
-        # Main interface
         col1, col2 = st.columns([2, 1])
         
         with col1:
@@ -671,14 +681,15 @@ class ArtGeneratorApp:
                 "Abstract geometric patterns in blue",
                 "Impressionist garden with flowers",
                 "Minimalist mountain landscape",
-                "Surreal floating islands"
+                "Surreal floating islands",
+                "Renaissance portrait with rich details",
+                "Watercolor seascape at dawn"
             ]
             
             for example in example_prompts:
                 if st.button(example, key=f"example_{example}"):
                     st.rerun()
 
-        # Generation button
         if st.button("🎨 Generate Art", type="primary", use_container_width=True):
             if "generation_count" not in st.session_state:
                 st.session_state.generation_count = 0
@@ -688,10 +699,8 @@ class ArtGeneratorApp:
             if not self.manage_rate_limit():
                 return
                 
-            # Increment counter
             st.session_state.generation_count += 1
             
-            # Show progress
             with st.spinner("🎨 Creating your artwork..."):
                 progress_bar = st.progress(0)
                 progress_bar.progress(25, "Analyzing style...")
@@ -699,13 +708,10 @@ class ArtGeneratorApp:
                 result = self.generate_art(prompt, style, feedback)
                 progress_bar.progress(100, "Complete!")
                 
-            # Display results
             self.display_results(result)
             
-            # Clear progress bar
             progress_bar.empty()
 
-        # Footer
         st.markdown("---")
         st.markdown(
             "💡 **Tips:** Be descriptive with your prompts, try different moods, "
